@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; background: transparent; color: #f4f1ff; font: 14px "DM Sans", Arial, sans-serif; }
+      .panel { overflow: hidden; border: 1px solid rgba(167,139,250,.25); border-radius: 17px; background: #100c22; }
+      .video-wrap { position: relative; min-height: 220px; background: radial-gradient(ellipse at center,#21183e,#0a0918 72%); }
+      video { display: block; width: 100%; min-height: 220px; max-height: 320px; object-fit: cover; transform: scaleX(-1); }
+      .placeholder { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; padding: 18px; color: #bcb3d3; }
+      .placeholder b { color: #eee9ff; font-size: 15px; margin-bottom: 8px; }
+      .placeholder button { cursor: pointer; border: 1px solid rgba(167,139,250,.38); border-radius: 10px; padding: 9px 12px; color: #f5f1ff; background: rgba(124,58,237,.2); font-weight: 700; }
+      .placeholder button { margin: 12px auto 0; }
+      .status { display: flex; justify-content: space-between; gap: 10px; align-items: center; min-height: 43px; padding: 9px 12px; color: #a7a0bc; font-size: 12px; }
+      .on { color: #6ee7b7; } .off { color: #fca5a5; }
+      .error { color: #fca5a5; padding: 2px 12px 12px; font-size: 12px; line-height: 1.5; }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <div class="video-wrap">
+        <video id="camera" autoplay playsinline muted></video>
+        <div class="placeholder" id="placeholder">
+          <b>Connecting to camera and microphone…</b>
+          <span>Allow access in your browser to start the interview.</span>
+          <button id="enable-camera" hidden>Enable Camera</button>
+        </div>
+      </div>
+      <div class="status">
+        <span id="camera-status">○ Camera Off</span>
+        <span id="mic-status">○ Microphone connecting</span>
+      </div>
+      <div class="error" id="media-error" role="status" aria-live="polite"></div>
+    </div>
+    <script>
+      (() => {
+        const video = document.getElementById("camera");
+        const placeholder = document.getElementById("placeholder");
+        const enableButton = document.getElementById("enable-camera");
+        const cameraStatus = document.getElementById("camera-status");
+        const micStatus = document.getElementById("mic-status");
+        const mediaError = document.getElementById("media-error");
+        const LANGUAGES = {
+          English: "en-IN", Telugu: "te-IN", Hindi: "hi-IN", Tamil: "ta-IN",
+          Kannada: "kn-IN", Malayalam: "ml-IN", Marathi: "mr-IN", Bengali: "bn-IN"
+        };
+        const state = {
+          stream: null,
+          recorder: null,
+          chunks: [],
+          props: null,
+          speechState: "your-turn",
+          mediaState: "requesting",
+          recordingState: "ready",
+          lastQuestionKey: "",
+          lastRepeatToken: 0,
+          lastRecordingCommand: 0,
+          lastEmission: "",
+          disposed: false
+        };
+
+        function sendValue(extra = {}) {
+          const cameraAvailable = Boolean(state.stream && state.stream.getVideoTracks().some(track => track.readyState === "live"));
+          const microphoneAvailable = Boolean(state.stream && state.stream.getAudioTracks().some(track => track.readyState === "live"));
+          const value = {
+            mediaState: state.mediaState,
+            recordingState: state.recordingState,
+            speechState: state.speechState,
+            cameraAvailable,
+            microphoneAvailable,
+            ...extra
+          };
+          const serialized = JSON.stringify(value);
+          if (serialized === state.lastEmission) return;
+          state.lastEmission = serialized;
+          window.parent.postMessage({
+            isStreamlitMessage: true,
+            type: "streamlit:setComponentValue",
+            value,
+            dataType: "json"
+          }, "*");
+        }
+
+        function setMediaStatus() {
+          const videoOn = Boolean(state.stream && state.stream.getVideoTracks().some(track => track.readyState === "live"));
+          const audioOn = Boolean(state.stream && state.stream.getAudioTracks().some(track => track.readyState === "live"));
+          cameraStatus.textContent = videoOn ? "● Camera On" : "○ Camera Off";
+          cameraStatus.className = videoOn ? "on" : "off";
+          micStatus.textContent = audioOn ? "● Microphone Ready" : "○ Microphone unavailable";
+          micStatus.className = audioOn ? "on" : "off";
+          placeholder.hidden = videoOn;
+          enableButton.hidden = videoOn;
+        }
+
+        function setError(message, cameraDenied = false) {
+          mediaError.textContent = message;
+          enableButton.hidden = !cameraDenied;
+          sendValue({ error: message });
+        }
+
+        async function requestMedia() {
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            state.mediaState = "unavailable";
+            setError("Camera and microphone require localhost or a secure HTTPS connection. This browser does not provide getUserMedia.");
+            setMediaStatus();
+            sendValue();
+            return;
+          }
+          if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+            state.mediaState = "insecure-context";
+            setError("Camera and microphone require localhost or a secure HTTPS connection.");
+            setMediaStatus();
+            sendValue();
+            return;
+          }
+          state.mediaState = "requesting";
+          setMediaStatus();
+          try {
+            state.stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+          } catch (combinedError) {
+            state.stream = new MediaStream();
+            let cameraError = null;
+            let microphoneError = null;
+            try {
+              const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+              cameraStream.getVideoTracks().forEach(track => state.stream.addTrack(track));
+            } catch (error) {
+              cameraError = error;
+            }
+            try {
+              const microphoneStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+              microphoneStream.getAudioTracks().forEach(track => state.stream.addTrack(track));
+            } catch (error) {
+              microphoneError = error;
+            }
+            if (!state.stream.getVideoTracks().length) {
+              state.mediaState = "camera-denied";
+              setError(cameraError && cameraError.name === "NotAllowedError"
+                ? "Camera permission was blocked. Please allow camera access in your browser settings and reload."
+                : "Camera access is required for video interviews.", true);
+            } else if (!state.stream.getAudioTracks().length) {
+              state.mediaState = "microphone-denied";
+              setError("Microphone unavailable. You can still provide a text answer.");
+            } else {
+              state.mediaState = "ready";
+              mediaError.textContent = "";
+            }
+            if (cameraError && microphoneError) {
+              state.mediaState = "permission-denied";
+              setError("Camera access is required for video interviews. Microphone unavailable; you can use a text answer.");
+            }
+            if (combinedError.name !== "NotAllowedError" && cameraError && microphoneError) {
+              setError("Camera and microphone could not be started. Check browser permissions and device connections.", true);
+            }
+          }
+          if (state.stream.getVideoTracks().length || state.stream.getAudioTracks().length) {
+            video.srcObject = state.stream;
+            await video.play().catch(() => {});
+          }
+          if (state.mediaState === "requesting") {
+            state.mediaState = "ready";
+            mediaError.textContent = "";
+          }
+          state.stream.getTracks().forEach(track => track.addEventListener("ended", () => {
+            setMediaStatus();
+            state.mediaState = "device-ended";
+            setError("Camera or microphone access ended. Check the browser permission and device settings.");
+            sendValue();
+          }));
+          setMediaStatus();
+          sendValue();
+        }
+
+        function closestVoice(languageTag) {
+          const voices = window.speechSynthesis.getVoices();
+          const requested = languageTag.toLowerCase();
+          const exact = voices.find(voice => voice.lang.toLowerCase() === requested);
+          if (exact) return exact;
+          const language = requested.split("-")[0];
+          const close = voices.find(voice => voice.lang.toLowerCase().split("-")[0] === language);
+          if (close) return close;
+          return voices.find(voice => voice.lang.toLowerCase() === "en-in")
+            || voices.find(voice => voice.lang.toLowerCase().startsWith("en"))
+            || null;
+        }
+
+        function speakQuestion(question, language) {
+          if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) {
+            state.speechState = "unsupported";
+            sendValue({ speechError: "This browser does not support spoken questions. You can read the question and continue." });
+            return;
+          }
+          window.speechSynthesis.cancel();
+          const languageTag = (state.props && state.props.languageTag) || LANGUAGES[language] || "en-IN";
+          const utterance = new SpeechSynthesisUtterance(question);
+          const voice = closestVoice(languageTag);
+          if (voice) {
+            utterance.voice = voice;
+            utterance.lang = voice.lang || languageTag;
+          } else {
+            utterance.lang = languageTag;
+          }
+          utterance.rate = 0.95;
+          utterance.pitch = 1;
+          utterance.onstart = () => {
+            state.speechState = "speaking";
+            sendValue();
+          };
+          utterance.onend = () => {
+            state.speechState = "your-turn";
+            sendValue();
+          };
+          utterance.onerror = event => {
+            state.speechState = "speech-error";
+            sendValue({ speechError: `Question audio could not be played (${event.error}). Use Repeat Question or check browser audio settings.` });
+          };
+          state.speechState = "speaking";
+          sendValue();
+          window.speechSynthesis.speak(utterance);
+        }
+
+        function stopRecording() {
+          const recorder = state.recorder;
+          if (recorder && (recorder.state === "recording" || recorder.state === "paused")) {
+            state.recordingState = "processing";
+            setMediaStatus();
+            recorder.stop();
+          }
+        }
+
+        function startRecording() {
+          if (!state.stream || !state.stream.getAudioTracks().some(track => track.readyState === "live")) {
+            state.mediaState = "microphone-denied";
+            setError("Microphone unavailable. You can still provide a text answer.");
+            sendValue();
+            return;
+          }
+          if (!window.MediaRecorder) {
+            setError("Audio recording is not supported by this browser. You can still provide a text answer.");
+            return;
+          }
+          const audioStream = new MediaStream(state.stream.getAudioTracks());
+          const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"]
+            .find(type => MediaRecorder.isTypeSupported(type));
+          state.chunks = [];
+          try {
+            state.recorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
+            state.recorder.ondataavailable = event => {
+              if (event.data && event.data.size) state.chunks.push(event.data);
+            };
+            state.recorder.onerror = () => {
+              state.recordingState = "ready";
+              setError("Microphone recording failed. You can still provide a text answer.");
+              setMediaStatus();
+              sendValue();
+            };
+            state.recorder.onstop = async () => {
+              const blob = new Blob(state.chunks, { type: state.recorder.mimeType || "audio/webm" });
+              const buffer = await blob.arrayBuffer();
+              const bytes = new Uint8Array(buffer);
+              let binary = "";
+              const chunkSize = 0x8000;
+              for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+              }
+              state.recordingState = "ready";
+              setMediaStatus();
+              sendValue({
+                audioData: btoa(binary),
+                audioType: blob.type,
+                audioId: Date.now()
+              });
+            };
+            state.recorder.start(500);
+            state.recordingState = "recording";
+            setMediaStatus();
+            sendValue();
+          } catch (error) {
+            state.recordingState = "ready";
+            setError(`Microphone recording failed: ${error.message}. You can still provide a text answer.`);
+            setMediaStatus();
+            sendValue();
+          }
+        }
+
+        function processProps(args) {
+          state.props = args;
+          if (!state.mediaRequested) {
+            state.mediaRequested = true;
+            requestMedia();
+          }
+          const key = `${args.questionIndex}|${args.language}|${args.question}`;
+          if (key !== state.lastQuestionKey) {
+            state.lastQuestionKey = key;
+            if (!args.paused) speakQuestion(args.question, args.language);
+          }
+          if (args.repeatToken !== state.lastRepeatToken) {
+            state.lastRepeatToken = args.repeatToken;
+            speakQuestion(args.question, args.language);
+          }
+          if (args.paused && !state.wasPaused) {
+            if ("speechSynthesis" in window) window.speechSynthesis.pause();
+            if (state.recorder && state.recorder.state === "recording") {
+              state.recorder.pause();
+              state.recordingState = "paused";
+              setMediaStatus();
+              sendValue();
+            }
+          } else if (!args.paused && state.wasPaused) {
+            if ("speechSynthesis" in window) window.speechSynthesis.resume();
+            if (state.recorder && state.recorder.state === "paused") {
+              state.recorder.resume();
+              state.recordingState = "recording";
+              setMediaStatus();
+              sendValue();
+            }
+          }
+          state.wasPaused = args.paused;
+          if (args.recordingCommandId !== state.lastRecordingCommand) {
+            state.lastRecordingCommand = args.recordingCommandId;
+            if (args.recordingCommand === "start") startRecording();
+            if (args.recordingCommand === "pause") {
+              if (state.recorder && state.recorder.state === "recording") {
+                state.recorder.pause();
+                state.recordingState = "paused";
+                setMediaStatus();
+                sendValue();
+              } else if (state.recorder && state.recorder.state === "paused") {
+                state.recorder.resume();
+                state.recordingState = "recording";
+                setMediaStatus();
+                sendValue();
+              }
+            }
+            if (args.recordingCommand === "finish") stopRecording();
+          }
+          setMediaStatus();
+        }
+
+        enableButton.addEventListener("click", () => {
+          state.mediaRequested = false;
+          mediaError.textContent = "";
+          requestMedia();
+          state.mediaRequested = true;
+        });
+        window.addEventListener("message", event => {
+          if (event.data && event.data.type === "streamlit:render") processProps(event.data.args || {});
+        });
+        window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+        const cleanup = () => {
+          state.disposed = true;
+          if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+          if (state.recorder && state.recorder.state !== "inactive") state.recorder.stop();
+          if (state.stream) state.stream.getTracks().forEach(track => track.stop());
+        };
+        window.addEventListener("pagehide", cleanup);
+        window.addEventListener("beforeunload", cleanup);
+      })();
+    </script>
+  </body>
+</html>
